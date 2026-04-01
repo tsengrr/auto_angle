@@ -1,100 +1,177 @@
-import tensorflow as tf
-from tensorflow.keras import layers, models
-from tensorflow.keras.applications import MobileNetV3Small
-import matplotlib.pyplot as plt
+import os
+import cv2
 import numpy as np
+import matplotlib.pyplot as plt
+import tensorflow as tf
+from tensorflow.keras import layers, models, backend as K
+from tensorflow.keras.applications import MobileNetV3Small
+from tensorflow.keras.optimizers import Adam
+from scipy.signal import argrelextrema
+from scipy.ndimage import gaussian_filter
 
-def build_mobilenetv3_unet(input_shape=(224, 224, 1)):
-    """
-    建構基於 MobileNetV3 的 UNET 影像分割模型
-    """
+# --- 1.  (Dice & IoU) ---
+def dice_coef(y_true, y_pred, smooth=1e-6):
+    y_true_f = K.flatten(tf.cast(y_true, tf.float32))
+    y_pred_f = K.flatten(y_pred)
+    intersection = K.sum(y_true_f * y_pred_f)
+    return (2. * intersection + smooth) / (K.sum(y_true_f) + K.sum(y_pred_f) + smooth)
+
+def iou_coef(y_true, y_pred, smooth=1e-6):
+
+    y_true_f = K.flatten(tf.cast(y_true, tf.float32))
+    y_pred_f = K.flatten(y_pred)
+    intersection = K.sum(y_true_f * y_pred_f)
+    union = K.sum(y_true_f) + K.sum(y_pred_f) - intersection
+    return (intersection + smooth) / (union + smooth)
+
+# --- 2. MobileNetV3 + UNET ---
+def build_mobilenetv3_unet(input_shape=(224, 224, 1)): 
+
     inputs = layers.Input(shape=input_shape)
+    
+    #Encoder: MobileNetV3Small
+    encoder = MobileNetV3Small(input_tensor=inputs, include_top=False, weights=None)
+    
+    # Skip Connection
+    s1 = encoder.layers[4].output                                  # 112x112
+    s2 = encoder.get_layer('expanded_conv_project_bn').output      # 56x56
+    s3 = encoder.get_layer('expanded_conv_2_add').output           # 28x28
+    s4 = encoder.get_layer('expanded_conv_5_add').output           # 14x14
+    bridge = encoder.output                                        # 7x7
 
-    # --- 1. 編碼器 Encoder ---
-    encoder = MobileNetV3Small(input_tensor=inputs, 
-                               input_shape=input_shape, 
-                               include_top=False, 
-                               weights=None)
+    # Decoder
+    def upsample_block(x, skip, filters):
+        x = layers.Conv2DTranspose(filters, (2, 2), strides=(2, 2), padding='same')(x)
+        x = layers.Concatenate()([x, skip])
+        x = layers.Conv2D(filters, (3, 3), activation='relu', padding='same')(x)
+        x = layers.Conv2D(filters, (3, 3), activation='relu', padding='same')(x)
+        return x
 
-    # --- 2. 擷取特徵圖 (Skip Connections) ---
-    s1 = encoder.layers[4].output      
-    s2 = encoder.get_layer('expanded_conv_project_bn').output      
-    s3 = encoder.get_layer('expanded_conv_2_add').output     
-    s4 = encoder.get_layer('expanded_conv_5_add').output     
-    bridge = encoder.output                                   
+    d1 = upsample_block(bridge, s4, 256)
+    d2 = upsample_block(d1, s3, 128)
+    d3 = upsample_block(d2, s2, 64)
+    d4 = upsample_block(d3, s1, 32)
 
-    # --- 3. 解碼器 Decoder (5次上取樣) ---
-    x = layers.Conv2DTranspose(256, (2, 2), strides=(2, 2), padding='same')(bridge)
-    x = layers.Concatenate()([x, s4])
-    x = layers.Conv2D(256, (3, 3), activation='relu', padding='same')(x)
-    x = layers.Conv2D(256, (3, 3), activation='relu', padding='same')(x)
-
-    x = layers.Conv2DTranspose(128, (2, 2), strides=(2, 2), padding='same')(x)
-    x = layers.Concatenate()([x, s3])
-    x = layers.Conv2D(128, (3, 3), activation='relu', padding='same')(x)
-    x = layers.Conv2D(128, (3, 3), activation='relu', padding='same')(x)
-
-    x = layers.Conv2DTranspose(64, (2, 2), strides=(2, 2), padding='same')(x)
-    x = layers.Concatenate()([x, s2])
-    x = layers.Conv2D(64, (3, 3), activation='relu', padding='same')(x)
-    x = layers.Conv2D(64, (3, 3), activation='relu', padding='same')(x)
-
-    x = layers.Conv2DTranspose(32, (2, 2), strides=(2, 2), padding='same')(x)
-    x = layers.Concatenate()([x, s1])
-    x = layers.Conv2D(32, (3, 3), activation='relu', padding='same')(x)
-    x = layers.Conv2D(32, (3, 3), activation='relu', padding='same')(x)
-
-    x = layers.Conv2DTranspose(16, (2, 2), strides=(2, 2), padding='same')(x)
-    x = layers.Conv2D(16, (3, 3), activation='relu', padding='same')(x)
-    x = layers.Conv2D(16, (3, 3), activation='relu', padding='same')(x)
-
-    # --- 4. 輸出層 ---
+    # 回復至原始大小並輸出 
+    x = layers.Conv2DTranspose(16, (2, 2), strides=(2, 2), padding='same')(d4)
     outputs = layers.Conv2D(1, (1, 1), activation='sigmoid', padding='same')(x)
 
-    return models.Model(inputs, outputs, name='MobileNetV3Small_UNET')
+    model = models.Model(inputs, outputs, name="MobileNetV3_UNET")
+    # 使用 Adam 優化器與二元交叉熵損失 
+    model.compile(optimizer=Adam(learning_rate=1e-4), loss='binary_crossentropy', 
+                  metrics=['accuracy', dice_coef, iou_coef])
+    return model
 
-def train_and_plot():
-    # 1. 準備模擬資料 (請在實際應用時替換成你的超音波影像矩陣)
-    print("正在準備 Train / Test 資料...")
-    X_train = np.random.rand(10, 224, 224, 1)  # 10張訓練圖
-    Y_train = np.random.randint(0, 2, size=(10, 224, 224, 1)) # 10張訓練標註
+# --- 3. 資料處理工具 (保留 Hsin-Yu 原本的血管軸搜尋邏輯) ---
+def get_cropImg_axis(img):   
+    # 透過亮度加總尋找血管壁位置
+    row_sum = gaussian_filter(np.sum(img, axis=1), sigma=7)
+    local_max = argrelextrema(row_sum, np.greater)[0]
     
-    X_test = np.random.rand(4, 224, 224, 1)    # 4張測試圖
-    Y_test = np.random.randint(0, 2, size=(4, 224, 224, 1))   # 4張測試標註
+    if len(local_max) < 2: return None
+    
+    # 抓取亮度最高的兩個峰值，代表上下壁 
+    max_idx = np.argsort(row_sum[local_max])[-2:] 
+    wallUp, wallDown = np.sort(local_max[max_idx])
+    axis = (wallUp + wallDown) // 2  # 血管中心軸
+    
+    
+    dist = wallDown - axis
+    cropLineUp = max(0, axis - int(dist * 1.5))
+    cropLineDown = min(img.shape[0], axis + int(dist * 1.5)) 
+    
+    cropImgFull = img[cropLineUp:cropLineDown, :]
+    
+    
+    return cropImgFull, axis - cropLineUp, wallUp - cropLineUp, wallDown - cropLineUp
 
-    # 2. 建構與編譯模型
-    model = build_mobilenetv3_unet()
-    model.compile(optimizer='adam',
-                  loss='binary_crossentropy',
-                  metrics=['accuracy']) # 這裡紀錄準確率
+def load_data(path):
+    images, masks = [], []
+    for root, _, files in os.walk(path):
+        for file in files:
+            fullpath = os.path.join(root, file)
+            if ".CRI" in file:
+                img = cv2.imread(fullpath, cv2.IMREAD_GRAYSCALE)[50:500, 100:700]
+                images.append(img)
+            elif ".png" in file:
+                mask = cv2.imread(fullpath, cv2.IMREAD_GRAYSCALE)[50:500, 100:700]
+                masks.append(mask)
+    return np.array(images), np.array(masks)
 
-    # 3. 執行訓練並儲存歷程 (History)
-    print("開始訓練模型...")
-    history = model.fit(
-        X_train, Y_train,
-        validation_data=(X_test, Y_test), # 傳入測試資料集
-        epochs=10,                        # 測試跑 10 個 Epoch
-        batch_size=2,
-        verbose=1                         # 顯示訓練進度條
-    )
+def system_augmentation(imgs, masks):
+    """每 5 度旋轉一次 (-60 到 60 度) """
+    aug_imgs, aug_masks = [], []
+    for i in range(len(imgs)):
+        for angle in range(-60, 65, 5):
+            h, w = imgs[i].shape[:2]
+            M = cv2.getRotationMatrix2D((w/2, h/2), angle, 1)
+            aug_imgs.append(cv2.warpAffine(imgs[i], M, (w, h)))
+            aug_masks.append(cv2.warpAffine(masks[i], M, (w, h)))
+    return np.array(aug_imgs), np.array(aug_masks)
 
-    # 4. 繪製 Accuracy 曲線
-    print("繪製訓練曲線...")
-    plt.figure(figsize=(8, 5))
+def preprocess_images(imgs, masks, size=(224, 224)):
+    """影像縮放與二次正規化"""
+    X, Y = [], []
+    for i in range(len(imgs)):
+        img = cv2.resize(imgs[i], size, interpolation=cv2.INTER_AREA)
+        mask = cv2.resize(masks[i], size, interpolation=cv2.INTER_NEAREST)
+        # 正規化至 [-1, 1] 
+        img = (img.astype(np.float32) / 255.0 - 0.5) / 0.5
+        X.append(img)
+        Y.append(mask.astype(np.float32) / 255.0)
+    return np.array(X).reshape(-1, size[0], size[1], 1), \
+           np.array(Y).reshape(-1, size[0], size[1], 1)
+
+if __name__ == "__main__":
+    DATA_PATH = "drive/MyDrive/大三專題/100-IMT-ImagesCY/train"
     
-    # 取出 history 字典裡的 acc 與 val_acc
-    plt.plot(history.history['accuracy'], label='Train Accuracy', linewidth=2)
-    plt.plot(history.history['val_accuracy'], label='Test (Validation) Accuracy', linewidth=2, linestyle='--')
+    print("read data...")
+    raw_imgs, raw_masks = load_data(DATA_PATH)
     
-    plt.title('Model Accuracy per Epoch', fontsize=14)
-    plt.xlabel('Epoch', fontsize=12)
-    plt.ylabel('Accuracy', fontsize=12)
-    plt.legend(loc='lower right')
-    plt.grid(True, linestyle=':', alpha=0.7)
+    print("vessel segmentation...")
+    bot_imgs, bot_masks = [], []
+    for i in range(len(raw_imgs)):
+        res = get_cropImg_axis(raw_imgs[i])
+        if res:
+            bot_imgs.append(res[0])
+            bot_masks.append(raw_masks[i][res[1]:res[2], :])
     
-    # 顯示圖表
+    #  Train (80%), Val (20%)
+    split = int(len(bot_imgs) * 0.8)
+    train_imgs, val_imgs = bot_imgs[:split], bot_imgs[split:]
+    train_masks, val_masks = bot_masks[:split], bot_masks[split:]
+    
+    # data argumentation
+    print("data argumentation...")
+    train_imgs_aug, train_masks_aug = system_augmentation(train_imgs, train_masks)
+    
+    # Resize 224x224 + Normalization
+    X_train, Y_train = preprocess_images(train_imgs_aug, train_masks_aug)
+    X_val, Y_val = preprocess_images(val_imgs, val_masks)
+    
+    print("MobileNetV3 + UNET ...")
+    model = build_mobilenetv3_unet(input_shape=(224, 224, 1))
+    model.summary() # 預期參數約 3.4~3.5M 
+    
+    print("Start training...")
+    history = model.fit(X_train, Y_train, validation_data=(X_val, Y_val), 
+                        epochs=50, batch_size=16)
+    
+    # plot training history
+    plt.figure(figsize=(12, 4))
+    plt.subplot(1, 2, 1)
+    plt.plot(history.history['dice_coef'], label='Train Dice')
+    plt.plot(history.history['val_dice_coef'], label='Val Dice')
+    plt.title('Dice Score')
+    plt.legend()
+    
+    plt.subplot(1, 2, 2)
+    plt.plot(history.history['loss'], label='Train Loss')
+    plt.plot(history.history['val_loss'], label='Val Loss')
+    plt.title('Loss')
+    plt.legend()
     plt.show()
-
-# 執行主程式
-if __name__ == '__main__':
-    train_and_plot()
+    
+    # 儲存模型
+    model.save("mobilenet_unet_doppler.h5")
+    print("model saved.")
