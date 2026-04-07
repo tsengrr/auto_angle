@@ -4,7 +4,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import tensorflow as tf
 from tensorflow.keras import layers, models, backend as K
-from tensorflow.keras.applications import MobileNetV3Small
+from tensorflow.keras.applications import MobileNetV3Large
 from tensorflow.keras.optimizers import Adam
 
 # --- 1. 評估指標定義 (Metrics) ---
@@ -24,13 +24,14 @@ def iou_coef(y_true, y_pred, smooth=1e-6):
 def build_mobilenetv3_unet(input_shape=(224, 224, 1)):
     inputs = layers.Input(shape=input_shape)
     
-    encoder = MobileNetV3Small(input_tensor=inputs, include_top=False, weights=None)
+    encoder = MobileNetV3Large(input_tensor=inputs, include_top=False, weights=None)
     
-    s1 = encoder.layers[4].output                                  # 112x112
-    s2 = encoder.get_layer('expanded_conv_project_bn').output      # 56x56
-    s3 = encoder.get_layer('expanded_conv_2_add').output           # 28x28
-    s4 = encoder.get_layer('expanded_conv_5_add').output           # 14x14
-    bridge = encoder.output                                        # 7x7
+    # 擷取 Large 版本對應解析度的特徵層
+    s1 = encoder.get_layer('expanded_conv_project_bn').output # 112x112
+    s2 = encoder.get_layer('expanded_conv_2_add').output     # 56x56
+    s3 = encoder.get_layer('expanded_conv_5_add').output     # 28x28
+    s4 = encoder.get_layer('expanded_conv_11_add').output    # 14x14
+    bridge = encoder.output                                   # 7x7
 
     # Decoder
     def upsample_block(x, skip, filters):
@@ -114,7 +115,7 @@ if __name__ == "__main__":
     train_imgs, train_masks = raw_imgs[train_idx], raw_masks[train_idx]
     val_imgs, val_masks = raw_imgs[val_idx], raw_masks[val_idx]
     
-    # 3. data argumentation
+    # 3. data augmentation
     print(f"the number of raw data: {len(train_imgs)}")
     X_train_aug, Y_train_aug = system_augmentation(train_imgs, train_masks)
     print(f"final number: {len(X_train_aug)}")
@@ -151,5 +152,5 @@ if __name__ == "__main__":
     plt.show()
     
     # 7. 儲存結果
-    model.save("vessel_lumen_mobilenet_small_unet.h5")
+    model.save("vessel_lumen_mobilenet_large_unet.h5")
     print("Model saved。")
