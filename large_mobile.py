@@ -90,7 +90,7 @@ def system_augmentation(imgs, masks):
             h, w = imgs[i].shape[:2]
             M = cv2.getRotationMatrix2D((w/2, h/2), angle, 1)
             aug_imgs.append(cv2.warpAffine(imgs[i], M, (w, h)))
-            aug_masks.append(cv2.warpAffine(masks[i], M, (w, h)))
+            aug_masks.append(cv2.warpAffine(masks[i], M, (w, h), flags=cv2.INTER_NEAREST))
     return np.array(aug_imgs), np.array(aug_masks)
 
 def preprocess_for_model(imgs, masks):

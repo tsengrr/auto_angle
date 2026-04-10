@@ -89,7 +89,7 @@ def system_augmentation(imgs, masks):
             h, w = imgs[i].shape[:2]
             M = cv2.getRotationMatrix2D((w/2, h/2), angle, 1)
             aug_imgs.append(cv2.warpAffine(imgs[i], M, (w, h)))
-            aug_masks.append(cv2.warpAffine(masks[i], M, (w, h)))
+            aug_masks.append(cv2.warpAffine(masks[i], M, (w, h), flags=cv2.INTER_NEAREST))
     return np.array(aug_imgs), np.array(aug_masks)
 
 def preprocess_for_model(imgs, masks):
@@ -114,7 +114,7 @@ if __name__ == "__main__":
     train_imgs, train_masks = raw_imgs[train_idx], raw_masks[train_idx]
     val_imgs, val_masks = raw_imgs[val_idx], raw_masks[val_idx]
     
-    # 3. data argumentation
+    # 3. data augmentation
     print(f"the number of raw data: {len(train_imgs)}")
     X_train_aug, Y_train_aug = system_augmentation(train_imgs, train_masks)
     print(f"final number: {len(X_train_aug)}")
