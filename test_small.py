@@ -27,15 +27,27 @@ def load_test_data(test_dir, target_size=(224, 224)):
     mask_dir = os.path.join(test_dir, "masks")
     
     if not os.path.exists(img_dir) or not os.path.exists(mask_dir):
-        raise FileNotFoundError("cannot find test_data/images")
+        raise FileNotFoundError("cannot find test_data/images or test_data/masks")
 
     raw_images, raw_masks, filenames = [], [], []
     file_list = sorted(os.listdir(img_dir))
     
     for filename in file_list:
-        img_path = os.path.join(img_dir, filename)
-        mask_path = os.path.join(mask_dir, filename)
         
+        # 防呆：確保只處理圖片檔，避免讀到 Mac 的 .DS_Store 等系統隱藏檔
+        if not filename.lower().endswith(('.png', '.jpg', '.jpeg')):
+            continue
+
+        img_path = os.path.join(img_dir, filename)
+        
+        # 【關鍵修改】透過原圖檔名，精準預測並組合出 Mask 的檔名
+        # rsplit('.', 1)[0] 會從右邊切開第一個小數點，取出純檔名
+        base_name = filename.rsplit('.', 1)[0]
+        mask_filename = f"{base_name}_label.png"
+        
+        mask_path = os.path.join(mask_dir, mask_filename)
+        
+        # 檢查對應的 _label.png 存不存在
         if os.path.exists(mask_path):
             img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
             mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
@@ -43,12 +55,19 @@ def load_test_data(test_dir, target_size=(224, 224)):
             # resize to 224*224
             if img.shape[:2] != target_size:
                 img = cv2.resize(img, target_size, interpolation=cv2.INTER_AREA)
+            # Mask 必須維持 INTER_NEAREST
             if mask.shape[:2] != target_size:
                 mask = cv2.resize(mask, target_size, interpolation=cv2.INTER_NEAREST)
                 
             raw_images.append(img)
             raw_masks.append(mask)
-            filenames.append(filename)
+            
+            # 這裡我們將 filenames 陣列保留「原圖的檔名 (filename)」
+            # 這樣在執行 test.py 最後儲存預測結果時，輸出的 png 名字才會跟原圖一模一樣
+            filenames.append(filename) 
+        else:
+            # 測試資料有缺漏時印出警告，方便除錯
+            print(f"⚠️ 測試集中找不到對應的標記圖，已跳過: {filename} (預期應有: {mask_filename})")
             
     return np.array(raw_images), np.array(raw_masks), filenames
 

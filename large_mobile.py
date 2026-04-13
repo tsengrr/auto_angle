@@ -6,6 +6,9 @@ import tensorflow as tf
 from tensorflow.keras import layers, models, backend as K
 from tensorflow.keras.applications import MobileNetV3Large
 from tensorflow.keras.optimizers import Adam
+from tensorflow.keras.callbacks import ModelCheckpoint
+
+
 
 # --- 1. 評估指標定義 (Metrics) ---
 def dice_coef(y_true, y_pred, smooth=1e-6):
@@ -27,10 +30,10 @@ def build_mobilenetv3_unet(input_shape=(224, 224, 1)):
     encoder = MobileNetV3Large(input_tensor=inputs, include_top=False, weights=None)
     
     # 擷取 Large 版本對應解析度的特徵層
-    s1 = encoder.get_layer('expanded_conv_project_bn').output # 112x112
-    s2 = encoder.get_layer('expanded_conv_2_add').output     # 56x56
-    s3 = encoder.get_layer('expanded_conv_5_add').output     # 28x28
-    s4 = encoder.get_layer('expanded_conv_11_add').output    # 14x14
+    s1 = encoder.get_layer('re_lu').output                # 112x112
+    s2 = encoder.get_layer('expanded_conv_2_add').output  # 56x56
+    s3 = encoder.get_layer('expanded_conv_5_add').output  # 28x28
+    s4 = encoder.get_layer('expanded_conv_11_add').output # 14x14
     bridge = encoder.output                                   # 7x7
 
     # Decoder
@@ -57,16 +60,27 @@ def build_mobilenetv3_unet(input_shape=(224, 224, 1)):
     return model
 
 def load_and_match_data(path):
-
     images, masks = [], []
     img_dir = os.path.join(path, "images") # raw data dir path 
     mask_dir = os.path.join(path, "masks") # labeled data dir path
     
     file_list = sorted(os.listdir(img_dir))
     for filename in file_list:
-        img_path = os.path.join(img_dir, filename)
-        mask_path = os.path.join(mask_dir, filename) 
         
+        # 防呆：確保只處理圖片檔，避免讀到 Mac 的 .DS_Store 等系統隱藏檔
+        if not filename.lower().endswith(('.png', '.jpg', '.jpeg')):
+            continue
+            
+        img_path = os.path.join(img_dir, filename)
+        
+        # 【關鍵修改】透過原圖檔名，精準預測並組合出 Mask 的檔名
+        # rsplit('.', 1)[0] 會從右邊切開第一個小數點，取出純檔名 (例如 "data1_5.83s")
+        base_name = filename.rsplit('.', 1)[0]
+        mask_filename = f"{base_name}_label.png"
+        
+        mask_path = os.path.join(mask_dir, mask_filename) 
+        
+        # 檢查這個 _label.png 存不存在
         if os.path.exists(mask_path):
             img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
             mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
@@ -74,11 +88,15 @@ def load_and_match_data(path):
             # make sure if is 224x224
             if img.shape[:2] != (224, 224):
                 img = cv2.resize(img, (224, 224))
+            # 注意：Mask 必須維持 INTER_NEAREST 避免產生灰階雜訊
             if mask.shape[:2] != (224, 224):
                 mask = cv2.resize(mask, (224, 224), interpolation=cv2.INTER_NEAREST)
                 
             images.append(img)
             masks.append(mask)
+        else:
+            # 如果發現有原圖沒標記，印出警告但不中斷程式
+            print(f"⚠️ 找不到對應的標記圖，已跳過: {filename} (預期應有: {mask_filename})")
             
     return np.array(images), np.array(masks)
 
@@ -128,12 +146,21 @@ if __name__ == "__main__":
     print("MobileNetV3 + UNET...")
     model = build_mobilenetv3_unet(input_shape=(224, 224, 1))
     
+    # 建立 Checkpoint 規則：監控驗證集的 Dice，只有變高時才存檔
+    checkpoint = ModelCheckpoint(
+        "vessel_lumen_mobilenet_large_unet.h5", 
+        monitor='val_dice_coef', 
+        mode='max', 
+        save_best_only=True, 
+        verbose=1
+    )
     print("Training...")
     history = model.fit(
         X_train, Y_train, 
         validation_data=(X_val, Y_val), 
         epochs=50, 
-        batch_size=16
+        batch_size=16,
+        callbacks=[checkpoint] # 把規則塞進去
     )
     
     # 6. 訓練歷程視覺化
@@ -149,8 +176,7 @@ if __name__ == "__main__":
     plt.plot(history.history['val_loss'], label='Val Loss')
     plt.title('Binary Crossentropy Loss')
     plt.legend()
+    plt.savefig("training_history_large.png", bbox_inches='tight')
     plt.show()
     
-    # 7. 儲存結果
-    model.save("vessel_lumen_mobilenet_large_unet.h5")
-    print("Model saved。")
+    
