@@ -6,7 +6,7 @@ import tensorflow as tf
 from tensorflow.keras import layers, models, backend as K
 from tensorflow.keras.applications import MobileNetV3Small
 from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.callbacks import ModelCheckpoint
+from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping
 
 # --- 1. 評估指標定義 (Metrics) ---
 def dice_coef(y_true, y_pred, smooth=1e-6):
@@ -24,8 +24,10 @@ def iou_coef(y_true, y_pred, smooth=1e-6):
 
 def build_mobilenetv3_unet(input_shape=(224, 224, 1)):
     inputs = layers.Input(shape=input_shape)
-    
-    encoder = MobileNetV3Small(input_tensor=inputs, include_top=False, weights=None)
+
+    # 灰階複製成 3 通道以使用 ImageNet 預訓練權重
+    x3 = layers.Concatenate()([inputs, inputs, inputs])
+    encoder = MobileNetV3Small(input_tensor=x3, include_top=False, weights='imagenet')
     
     s1 = encoder.layers[4].output                                  # 112x112
     s2 = encoder.get_layer('expanded_conv_project_bn').output      # 56x56
@@ -38,6 +40,7 @@ def build_mobilenetv3_unet(input_shape=(224, 224, 1)):
         x = layers.Conv2DTranspose(filters, (2, 2), strides=(2, 2), padding='same')(x)
         x = layers.Concatenate()([x, skip])
         x = layers.Conv2D(filters, (3, 3), activation='relu', padding='same')(x)
+        x = layers.Dropout(0.3)(x)
         x = layers.Conv2D(filters, (3, 3), activation='relu', padding='same')(x)
         return x
 
@@ -79,8 +82,8 @@ def load_and_match_data(path):
         
         # 檢查這個 _label.png 存不存在
         if os.path.exists(mask_path):
-            img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
-            mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+            img = cv2.imdecode(np.fromfile(img_path, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
+            mask = cv2.imdecode(np.fromfile(mask_path, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
             
             # make sure if is 224x224
             if img.shape[:2] != (224, 224):
@@ -116,7 +119,7 @@ def preprocess_for_model(imgs, masks):
 
 if __name__ == "__main__":
 
-    DATA_PATH = "drive/MyDrive/path_to_your_dataset" # need to change
+    DATA_PATH = "/mnt/c/Users/chloe/OneDrive/桌面/auto_angle"
     
     print("load data...")
     raw_imgs, raw_masks = load_and_match_data(DATA_PATH)
@@ -144,20 +147,28 @@ if __name__ == "__main__":
     model = build_mobilenetv3_unet(input_shape=(224, 224, 1))
     
     checkpoint = ModelCheckpoint(
-    "vessel_lumen_mobilenet_small_unet.h5", 
-    monitor='val_dice_coef', 
-    mode='max', 
-    save_best_only=True, 
+    "vessel_lumen_mobilenet_small_unet.h5",
+    monitor='val_dice_coef',
+    mode='max',
+    save_best_only=True,
     verbose=1
     )
-       
+
+    early_stop = EarlyStopping(
+        monitor='val_dice_coef',
+        mode='max',
+        patience=15,
+        restore_best_weights=True,
+        verbose=1
+    )
+
     print("Training...")
     history = model.fit(
-        X_train, Y_train, 
-        validation_data=(X_val, Y_val), 
-        epochs=50, 
+        X_train, Y_train,
+        validation_data=(X_val, Y_val),
+        epochs=100,
         batch_size=16,
-        callbacks=[checkpoint] # 把規則塞進去
+        callbacks=[checkpoint, early_stop]
     )
     
     # 6. 訓練歷程視覺化
@@ -173,7 +184,7 @@ if __name__ == "__main__":
     plt.plot(history.history['val_loss'], label='Val Loss')
     plt.title('Binary Crossentropy Loss')
     plt.legend()
-    plt.savefig("training_history_small.png", bbox_inches='tight')
+    plt.savefig("/mnt/c/Users/chloe/OneDrive/桌面/auto_angle/training_history_small.png", bbox_inches='tight')
     plt.show()
     
     
