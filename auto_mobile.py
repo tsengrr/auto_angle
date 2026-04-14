@@ -6,7 +6,7 @@ import tensorflow as tf
 from tensorflow.keras import layers, models, backend as K
 from tensorflow.keras.applications import MobileNetV3Small
 from tensorflow.keras.optimizers import Adam
-from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping
+from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping, ReduceLROnPlateau
 
 # --- 1. 評估指標定義 (Metrics) ---
 def dice_coef(y_true, y_pred, smooth=1e-6):
@@ -157,8 +157,17 @@ if __name__ == "__main__":
     early_stop = EarlyStopping(
         monitor='val_dice_coef',
         mode='max',
-        patience=15,
+        patience=20,
         restore_best_weights=True,
+        verbose=1
+    )
+
+    reduce_lr = ReduceLROnPlateau(
+        monitor='val_dice_coef',
+        mode='max',
+        factor=0.5,
+        patience=5,
+        min_lr=1e-7,
         verbose=1
     )
 
@@ -166,9 +175,9 @@ if __name__ == "__main__":
     history = model.fit(
         X_train, Y_train,
         validation_data=(X_val, Y_val),
-        epochs=100,
+        epochs=150,
         batch_size=16,
-        callbacks=[checkpoint, early_stop]
+        callbacks=[checkpoint, early_stop, reduce_lr]
     )
     
     # 6. 訓練歷程視覺化
