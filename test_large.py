@@ -1,9 +1,10 @@
 import os
 import cv2
 import numpy as np
-import matplotlib.pyplot as plt
 import tensorflow as tf
-from tensorflow.keras.models import load_model
+from tensorflow.keras import layers, models
+from tensorflow.keras.applications import MobileNetV3Large
+from tensorflow.keras.optimizers import Adam
 import tensorflow.keras.backend as K
 
 
@@ -20,72 +21,102 @@ def iou_coef(y_true, y_pred, smooth=1e-6):
     union = K.sum(y_true_f) + K.sum(y_pred_f) - intersection
     return (intersection + smooth) / (union + smooth)
 
+def dice_loss(y_true, y_pred):
+    return 1 - dice_coef(y_true, y_pred)
+
+def combined_loss(y_true, y_pred):
+    return 0.3 * tf.keras.losses.binary_crossentropy(y_true, y_pred) + 0.7 * dice_loss(y_true, y_pred)
+
+def attention_gate(x, skip, filters):
+    g = layers.Conv2D(filters, (1, 1), padding='same')(x)
+    s = layers.Conv2D(filters, (1, 1), padding='same')(skip)
+    attn = layers.Add()([g, s])
+    attn = layers.Activation('relu')(attn)
+    attn = layers.Conv2D(1, (1, 1), padding='same', activation='sigmoid')(attn)
+    return layers.Multiply()([skip, attn])
+
+def build_mobilenetv3_unet(input_shape=(224, 224, 1), use_attention=False):
+    """use_attention=True 用新架構，False 用舊架構"""
+    inputs = layers.Input(shape=input_shape)
+    x3 = layers.Concatenate()([inputs, inputs, inputs])
+    encoder = MobileNetV3Large(input_tensor=x3, include_top=False, weights=None, include_preprocessing=False)
+    s1 = encoder.get_layer('re_lu').output
+    s2 = encoder.get_layer('expanded_conv_2_add').output
+    s3 = encoder.get_layer('expanded_conv_5_add').output
+    s4 = encoder.get_layer('expanded_conv_11_add').output
+    bridge = encoder.output
+
+    def upsample_block(x, skip, filters):
+        x = layers.Conv2DTranspose(filters, (2, 2), strides=(2, 2), padding='same')(x)
+        if use_attention:
+            skip = attention_gate(x, skip, filters // 4)
+        x = layers.Concatenate()([x, skip])
+        x = layers.Conv2D(filters, (3, 3), activation='relu', padding='same')(x)
+        x = layers.Dropout(0.3)(x)
+        x = layers.Conv2D(filters, (3, 3), activation='relu', padding='same')(x)
+        return x
+
+    d1 = upsample_block(bridge, s4, 256)
+    d2 = upsample_block(d1, s3, 128)
+    d3 = upsample_block(d2, s2, 64)
+    d4 = upsample_block(d3, s1, 32)
+    x = layers.Conv2DTranspose(16, (2, 2), strides=(2, 2), padding='same')(d4)
+    outputs = layers.Conv2D(1, (1, 1), activation='sigmoid', padding='same')(x)
+    name = "MobileNetV3_AttUNET" if use_attention else "MobileNetV3_UNET"
+    model = models.Model(inputs, outputs, name=name)
+    model.compile(optimizer=Adam(learning_rate=1e-4),
+                  loss=combined_loss,
+                  metrics=['accuracy', dice_coef, iou_coef])
+    return model
+
 
 def load_test_data(test_dir, target_size=(224, 224)):
-    """read testing data"""
-    img_dir = os.path.join(test_dir, "images")
-    mask_dir = os.path.join(test_dir, "masks")
-    
+    img_dir = os.path.join(test_dir, "test_images")
+    mask_dir = os.path.join(test_dir, "test_masks")
     if not os.path.exists(img_dir) or not os.path.exists(mask_dir):
-        raise FileNotFoundError("cannot find test_data/images or test_data/masks")
+        raise FileNotFoundError("cannot find test_data/test_images or test_data/test_masks")
 
     raw_images, raw_masks, filenames = [], [], []
-    file_list = sorted(os.listdir(img_dir))
-    
-    for filename in file_list:
-        
-        # 防呆：確保只處理圖片檔，避免讀到 Mac 的 .DS_Store 等系統隱藏檔
+    for filename in sorted(os.listdir(img_dir)):
         if not filename.lower().endswith(('.png', '.jpg', '.jpeg')):
             continue
-
         img_path = os.path.join(img_dir, filename)
-        
-        # 【關鍵修改】透過原圖檔名，精準預測並組合出 Mask 的檔名
-        # rsplit('.', 1)[0] 會從右邊切開第一個小數點，取出純檔名
         base_name = filename.rsplit('.', 1)[0]
-        mask_filename = f"{base_name}_label.png"
-        
-        mask_path = os.path.join(mask_dir, mask_filename)
-        
-        # 檢查對應的 _label.png 存不存在
+        mask_path = os.path.join(mask_dir, f"{base_name}_label.png")
+
         if os.path.exists(mask_path):
-            img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
-            mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
-            
-            # resize to 224*224
-            if img.shape[:2] != target_size:
-                img = cv2.resize(img, target_size, interpolation=cv2.INTER_AREA)
-            # Mask 必須維持 INTER_NEAREST
-            if mask.shape[:2] != target_size:
-                mask = cv2.resize(mask, target_size, interpolation=cv2.INTER_NEAREST)
-                
+            img  = cv2.imdecode(np.fromfile(img_path,  dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
+            mask = cv2.imdecode(np.fromfile(mask_path, dtype=np.uint8), cv2.IMREAD_GRAYSCALE)
+            if img.shape[:2]  != target_size: img  = cv2.resize(img,  target_size, interpolation=cv2.INTER_AREA)
+            if mask.shape[:2] != target_size: mask = cv2.resize(mask, target_size, interpolation=cv2.INTER_NEAREST)
             raw_images.append(img)
             raw_masks.append(mask)
-            
-            # 這裡我們將 filenames 陣列保留「原圖的檔名 (filename)」
-            # 這樣在執行 test.py 最後儲存預測結果時，輸出的 png 名字才會跟原圖一模一樣
-            filenames.append(filename) 
+            filenames.append(filename)
         else:
-            # 測試資料有缺漏時印出警告，方便除錯
-            print(f"⚠️ 測試集中找不到對應的標記圖，已跳過: {filename} (預期應有: {mask_filename})")
-            
+            print(f"⚠️ 找不到對應標記圖，跳過: {filename}")
+
     return np.array(raw_images), np.array(raw_masks), filenames
 
+
 def preprocess_for_inference(imgs, masks):
-    """Normalized to [0,1]"""
     X = (imgs.astype(np.float32) / 255.0 - 0.5) / 0.5
     Y = masks.astype(np.float32) / 255.0
-    return np.expand_dims(X, axis=-1), np.expand_dims(Y, axis=-1)
+    return np.expand_dims(X, -1), np.expand_dims(Y, -1)
+
+
+def dice_per_image(y_true, y_pred, smooth=1e-6):
+    y_true_f = y_true.flatten().astype(np.float32)
+    y_pred_f = y_pred.flatten().astype(np.float32)
+    intersection = np.sum(y_true_f * y_pred_f)
+    return (2. * intersection + smooth) / (np.sum(y_true_f) + np.sum(y_pred_f) + smooth)
 
 
 if __name__ == "__main__":
 
-    MODEL_PATH = "vessel_lumen_mobilenet_large_unet.h5"  
-    TEST_DIR = "test_data"                         
-    OUTPUT_DIR = "test_results"                    
-
-    if not os.path.exists(OUTPUT_DIR):
-        os.makedirs(OUTPUT_DIR)
+    BASE_DIR   = "/mnt/c/Users/chloe/OneDrive/桌面/auto_angle"
+    MODEL_PATH = os.path.join(BASE_DIR, "vessel_lumen_mobilenet_large_unet.h5")
+    TEST_DIR   = os.path.join(BASE_DIR, "test_data")
+    PRED_DIR   = os.path.join(BASE_DIR, "predictions_output_large")
 
     print("reading testing data...")
     raw_imgs, raw_masks, filenames = load_test_data(TEST_DIR)
@@ -93,33 +124,42 @@ if __name__ == "__main__":
 
     X_test, Y_test = preprocess_for_inference(raw_imgs, raw_masks)
 
-    print(f"loading model{MODEL_PATH} ...")
-    model = load_model(MODEL_PATH, custom_objects={'dice_coef': dice_coef, 'iou_coef': iou_coef})
+    print(f"loading model {MODEL_PATH} ...")
+    model = build_mobilenetv3_unet(input_shape=(224, 224, 1), use_attention=False)
+    model.load_weights(MODEL_PATH)
 
-    print("\nTest Score...")
-    results = model.evaluate(X_test, Y_test, verbose=0)
-    print("="*30)
-    print(f"Test Loss (BCE) : {results[0]:.4f}")
-    print(f"Test Accuracy   : {results[1]:.4f}")
-    print(f"Test Dice Score : {results[2]:.4f}")  # > 0.9 good good
-    print("="*30)
+    print("\ngenerating predicted mask...")
+    predictions = model.predict(X_test, verbose=0)
 
-    print("\n generating predicted mask...")
-    predictions = model.predict(X_test)
+    os.makedirs(PRED_DIR, exist_ok=True)
+    result_path = os.path.join(BASE_DIR, "test_mobilenet_large_results.txt")
+    dice_scores = []
 
-    # 建立專門存放 prediction 的資料夾
-    PRED_DIR = "predictions_output_large"
-    if not os.path.exists(PRED_DIR):
-        os.makedirs(PRED_DIR)
+    with open(result_path, "w", encoding="utf-8") as f:
+        header = f"{'Filename':<40} {'Dice':>8}\n" + "-" * 55 + "\n"
+        f.write(header)
+        print(header, end="")
 
-    for i in range(len(raw_imgs)):
-        filename = filenames[i] 
+        for i, fname in enumerate(filenames):
+            d = dice_per_image(Y_test[i], predictions[i])
+            dice_scores.append(d)
+            line = f"{fname:<40} {d:>8.4f}\n"
+            f.write(line)
+            print(line, end="")
 
-        pred_mask = (predictions[i] > 0.5).astype(np.uint8) * 255
-        
-        pred_mask = np.squeeze(pred_mask) 
+            mask = (predictions[i] > 0.5).astype(np.uint8) * 255
+            mask = np.squeeze(mask)
+            cv2.imencode('.png', mask)[1].tofile(os.path.join(PRED_DIR, fname))
 
-        save_path = os.path.join(PRED_DIR, filename)
-        cv2.imwrite(save_path, pred_mask)
+        dice_scores = np.array(dice_scores)
+        stats = (
+            "-" * 55 + "\n"
+            f"Mean ± Std : {dice_scores.mean():.4f} ± {dice_scores.std():.4f}\n"
+            f"Min / Max  : {dice_scores.min():.4f} / {dice_scores.max():.4f}\n"
+            f"Count      : {len(dice_scores)}\n"
+            f"Masks dir  : {PRED_DIR}\n"
+        )
+        f.write(stats)
+        print(stats)
 
-    print(f"\npredicted mask saved")
+    print(f"Results saved to {result_path}")
