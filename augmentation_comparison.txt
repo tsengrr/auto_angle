@@ -1,0 +1,227 @@
+資料增廣策略比較 (MobileNetV3Large + U-Net, val = data4 + data6)
+================================================================================
+
+| 資料增廣          | 資料放大倍率 | Mean ± Std        | Min / Max         |
+|-------------------|:------------:|:-----------------:|:-----------------:|
+| 25 Angles         |     25x      | 0.8004 ± 0.1017   | 0.3818 / 0.9131   |
+| 4 角度 × 6 變體   |     24x      | 0.8057 ± 0.0744   | 0.5510 / 0.9082   |
+| 25 角度 × 2 變體  |     50x      | 0.8193 ± 0.0922   | 0.4175 / 0.9603   |
+| 7 角度 × 7 變體   |     49x      | 0.8280 ± 0.0849   | 0.4836 / 0.9555   | ← 目前最佳
+| 7 角度 × 10 變體  |     70x      | 0.8174 ± 0.0826   | 0.4834 / 0.9440   |
+
+
+================================================================================
+[1] 25 Angles (25x)
+================================================================================
+def system_augmentation(imgs, masks):
+    """每 5 度旋轉一次 (-60 到 60 度)"""
+    aug_imgs, aug_masks = [], []
+    for i in range(len(imgs)):
+        for angle in range(-60, 65, 5):
+            h, w = imgs[i].shape[:2]
+            M = cv2.getRotationMatrix2D((w/2, h/2), angle, 1)
+            aug_imgs.append(cv2.warpAffine(imgs[i], M, (w, h)))
+            aug_masks.append(cv2.warpAffine(masks[i], M, (w, h),
+                                            flags=cv2.INTER_NEAREST))
+    return np.array(aug_imgs), np.array(aug_masks)
+
+
+================================================================================
+[2] 4 角度 × 6 變體 (24x)
+================================================================================
+_AUG_ANGLES = [-30, -10, 10, 30]
+
+def system_augmentation(imgs, masks):
+    """4 角度 × 6 變體 = 24× 放大"""
+    aug_imgs, aug_masks = [], []
+    for i in range(len(imgs)):
+        img, mask = imgs[i], masks[i]
+        h, w = img.shape[:2]
+
+        for angle in _AUG_ANGLES:
+            M = cv2.getRotationMatrix2D((w / 2, h / 2), angle, 1)
+            r_img  = cv2.warpAffine(img,  M, (w, h))
+            r_mask = cv2.warpAffine(mask, M, (w, h), flags=cv2.INTER_NEAREST)
+
+            # 1. 原旋轉
+            aug_imgs.append(r_img)
+            aug_masks.append(r_mask)
+
+            # 2. 水平翻轉
+            aug_imgs.append(cv2.flip(r_img, 1))
+            aug_masks.append(cv2.flip(r_mask, 1))
+
+            # 3. 亮度 +30
+            aug_imgs.append(np.clip(r_img.astype(np.int32) + 30, 0, 255).astype(np.uint8))
+            aug_masks.append(r_mask)
+
+            # 4. 亮度 -30
+            aug_imgs.append(np.clip(r_img.astype(np.int32) - 30, 0, 255).astype(np.uint8))
+            aug_masks.append(r_mask)
+
+            # 5. 高斯模糊
+            aug_imgs.append(cv2.GaussianBlur(r_img, (5, 5), 0))
+            aug_masks.append(r_mask)
+
+            # 6. 加法高斯噪點
+            noise = np.random.normal(0, 15, r_img.shape).astype(np.int32)
+            noisy = np.clip(r_img.astype(np.int32) + noise, 0, 255).astype(np.uint8)
+            aug_imgs.append(noisy)
+            aug_masks.append(r_mask)
+
+    return np.array(aug_imgs), np.array(aug_masks)
+
+
+================================================================================
+[3] 25 角度 × 2 變體 (50x)
+================================================================================
+def elastic_transform(img, mask, alpha=30, sigma=4):
+    """彈性變形：模擬超音波探頭壓力造成的局部形變"""
+    h, w = img.shape[:2]
+    dx = cv2.GaussianBlur(np.random.randn(h, w).astype(np.float32), (0, 0), sigma) * alpha
+    dy = cv2.GaussianBlur(np.random.randn(h, w).astype(np.float32), (0, 0), sigma) * alpha
+    x, y = np.meshgrid(np.arange(w), np.arange(h))
+    map_x = (x + dx).astype(np.float32)
+    map_y = (y + dy).astype(np.float32)
+    img_out  = cv2.remap(img,  map_x, map_y, cv2.INTER_LINEAR,  borderMode=cv2.BORDER_REFLECT)
+    mask_out = cv2.remap(mask, map_x, map_y, cv2.INTER_NEAREST, borderMode=cv2.BORDER_REFLECT)
+    return img_out, mask_out
+
+
+def system_augmentation(imgs, masks):
+    """25 角度 × 2 變體 (原旋轉 + 彈性變形) = 50× 放大"""
+    aug_imgs, aug_masks = [], []
+    for i in range(len(imgs)):
+        img, mask = imgs[i], masks[i]
+        h, w = img.shape[:2]
+
+        for angle in range(-60, 65, 5):
+            M = cv2.getRotationMatrix2D((w / 2, h / 2), angle, 1)
+            r_img  = cv2.warpAffine(img,  M, (w, h))
+            r_mask = cv2.warpAffine(mask, M, (w, h), flags=cv2.INTER_NEAREST)
+
+            # 1. 原旋轉
+            aug_imgs.append(r_img)
+            aug_masks.append(r_mask)
+
+            # 2. 彈性變形
+            e_img, e_mask = elastic_transform(r_img, r_mask)
+            aug_imgs.append(e_img)
+            aug_masks.append(e_mask)
+
+    return np.array(aug_imgs), np.array(aug_masks)
+
+
+================================================================================
+[4] 7 角度 × 7 變體 (49x)  ← 目前最佳
+================================================================================
+def elastic_transform(img, mask, alpha=30, sigma=4):
+    """彈性變形：模擬超音波探頭壓力造成的局部形變"""
+    h, w = img.shape[:2]
+    dx = cv2.GaussianBlur(np.random.randn(h, w).astype(np.float32), (0, 0), sigma) * alpha
+    dy = cv2.GaussianBlur(np.random.randn(h, w).astype(np.float32), (0, 0), sigma) * alpha
+    x, y = np.meshgrid(np.arange(w), np.arange(h))
+    map_x = (x + dx).astype(np.float32)
+    map_y = (y + dy).astype(np.float32)
+    img_out  = cv2.remap(img,  map_x, map_y, cv2.INTER_LINEAR,  borderMode=cv2.BORDER_REFLECT)
+    mask_out = cv2.remap(mask, map_x, map_y, cv2.INTER_NEAREST, borderMode=cv2.BORDER_REFLECT)
+    return img_out, mask_out
+
+
+_AUG_ANGLES = [-30, -20, -10, 0, 10, 20, 30]
+
+def system_augmentation(imgs, masks):
+    """7 角度 × 7 變體 = 49× 放大"""
+    aug_imgs, aug_masks = [], []
+    for i in range(len(imgs)):
+        img, mask = imgs[i], masks[i]
+        h, w = img.shape[:2]
+
+        for angle in _AUG_ANGLES:
+            M = cv2.getRotationMatrix2D((w / 2, h / 2), angle, 1)
+            r_img  = cv2.warpAffine(img,  M, (w, h))
+            r_mask = cv2.warpAffine(mask, M, (w, h), flags=cv2.INTER_NEAREST)
+
+            # 1. 原旋轉
+            aug_imgs.append(r_img)
+            aug_masks.append(r_mask)
+
+            # 2. 水平翻轉
+            aug_imgs.append(cv2.flip(r_img, 1))
+            aug_masks.append(cv2.flip(r_mask, 1))
+
+            # 3. 亮度 +30
+            aug_imgs.append(np.clip(r_img.astype(np.int32) + 30, 0, 255).astype(np.uint8))
+            aug_masks.append(r_mask)
+
+            # 4. 亮度 -30
+            aug_imgs.append(np.clip(r_img.astype(np.int32) - 30, 0, 255).astype(np.uint8))
+            aug_masks.append(r_mask)
+
+            # 5. 高斯模糊（模擬超音波對焦不準）
+            blurred = cv2.GaussianBlur(r_img, (5, 5), 0)
+            aug_imgs.append(blurred)
+            aug_masks.append(r_mask)
+
+            # 6. 加法高斯噪點（一般感測器雜訊）
+            noise = np.random.normal(0, 15, r_img.shape).astype(np.int32)
+            noisy = np.clip(r_img.astype(np.int32) + noise, 0, 255).astype(np.uint8)
+            aug_imgs.append(noisy)
+            aug_masks.append(r_mask)
+
+            # 7. 彈性變形（模擬組織形變）
+            e_img, e_mask = elastic_transform(r_img, r_mask)
+            aug_imgs.append(e_img)
+            aug_masks.append(e_mask)
+
+    return np.array(aug_imgs), np.array(aug_masks)
+
+
+================================================================================
+[5] 7 角度 × 10 變體 (70x)
+================================================================================
+# 在 [4] 7×7 的基礎上多加 3 種變體：
+
+_AUG_ANGLES = [-30, -20, -10, 0, 10, 20, 30]
+
+def system_augmentation(imgs, masks):
+    """7 角度 × 10 變體 = 70× 放大"""
+    aug_imgs, aug_masks = [], []
+    for i in range(len(imgs)):
+        img, mask = imgs[i], masks[i]
+        h, w = img.shape[:2]
+
+        for angle in _AUG_ANGLES:
+            M = cv2.getRotationMatrix2D((w / 2, h / 2), angle, 1)
+            r_img  = cv2.warpAffine(img,  M, (w, h))
+            r_mask = cv2.warpAffine(mask, M, (w, h), flags=cv2.INTER_NEAREST)
+
+            # 1~7：同 [4] 7×7
+            aug_imgs.append(r_img); aug_masks.append(r_mask)
+            aug_imgs.append(cv2.flip(r_img, 1)); aug_masks.append(cv2.flip(r_mask, 1))
+            aug_imgs.append(np.clip(r_img.astype(np.int32) + 30, 0, 255).astype(np.uint8)); aug_masks.append(r_mask)
+            aug_imgs.append(np.clip(r_img.astype(np.int32) - 30, 0, 255).astype(np.uint8)); aug_masks.append(r_mask)
+            aug_imgs.append(cv2.GaussianBlur(r_img, (5, 5), 0)); aug_masks.append(r_mask)
+            noise = np.random.normal(0, 15, r_img.shape).astype(np.int32)
+            aug_imgs.append(np.clip(r_img.astype(np.int32) + noise, 0, 255).astype(np.uint8)); aug_masks.append(r_mask)
+            e_img, e_mask = elastic_transform(r_img, r_mask)
+            aug_imgs.append(e_img); aug_masks.append(e_mask)
+
+            # 8. Speckle noise (乘法噪點，模擬超音波散斑)
+            speckle = r_img.astype(np.float32) * (1 + np.random.normal(0, 0.1, r_img.shape))
+            aug_imgs.append(np.clip(speckle, 0, 255).astype(np.uint8))
+            aug_masks.append(r_mask)
+
+            # 9. Gamma 變暗 (gamma=1.5)
+            gamma_dark = np.power(r_img / 255.0, 1.5) * 255.0
+            aug_imgs.append(gamma_dark.astype(np.uint8))
+            aug_masks.append(r_mask)
+
+            # 10. Gamma 變亮 (gamma=0.7)
+            gamma_bright = np.power(r_img / 255.0, 0.7) * 255.0
+            aug_imgs.append(gamma_bright.astype(np.uint8))
+            aug_masks.append(r_mask)
+
+    return np.array(aug_imgs), np.array(aug_masks)
+
+
