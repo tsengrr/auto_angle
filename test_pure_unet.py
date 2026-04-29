@@ -3,7 +3,6 @@ import cv2
 import numpy as np
 import tensorflow as tf
 from tensorflow.keras import layers, models
-from tensorflow.keras.applications import MobileNetV3Large
 from tensorflow.keras.optimizers import Adam
 import tensorflow.keras.backend as K
 
@@ -27,51 +26,73 @@ def dice_loss(y_true, y_pred):
 def combined_loss(y_true, y_pred):
     return 0.5 * tf.keras.losses.binary_crossentropy(y_true, y_pred) + 0.5 * dice_loss(y_true, y_pred)
 
-def attention_gate(x, skip, filters):
-    g = layers.Conv2D(filters, (1, 1), padding='same')(x)
-    s = layers.Conv2D(filters, (1, 1), padding='same')(skip)
-    attn = layers.Add()([g, s])
-    attn = layers.Activation('relu')(attn)
+
+def double_conv_block(x, filters):
+    x = layers.Conv2D(filters, (3, 3), padding="same", kernel_initializer="he_normal")(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Activation("relu")(x)
+    x = layers.Conv2D(filters, (3, 3), padding="same", kernel_initializer="he_normal")(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Activation("relu")(x)
+    return x
+
+def attention_gate(g, s, inter_filters):
+    Wg = layers.Conv2D(inter_filters, (1, 1), padding='same')(g)
+    Ws = layers.Conv2D(inter_filters, (1, 1), padding='same')(s)
+    attn = layers.Activation('relu')(layers.Add()([Wg, Ws]))
     attn = layers.Conv2D(1, (1, 1), padding='same', activation='sigmoid')(attn)
-    return layers.Multiply()([skip, attn])
+    return layers.Multiply()([s, attn])
 
-def build_mobilenetv3_unet(input_shape=(224, 224, 1), use_attention=False):
-    """use_attention=True 用新架構，False 用舊架構"""
+def build_pure_unet(input_shape=(224, 224, 1)):
     inputs = layers.Input(shape=input_shape)
-    x3 = layers.Concatenate()([inputs, inputs, inputs])
-    encoder = MobileNetV3Large(input_tensor=x3, include_top=False, weights=None, include_preprocessing=False)
-    s1 = encoder.get_layer('re_lu').output
-    s2 = encoder.get_layer('expanded_conv_2_add').output
-    s3 = encoder.get_layer('expanded_conv_5_add').output
-    s4 = encoder.get_layer('expanded_conv_11_add').output
-    bridge = encoder.output
 
-    def upsample_block(x, skip, filters):
-        x = layers.Conv2DTranspose(filters, (2, 2), strides=(2, 2), padding='same')(x)
-        if use_attention:
-            skip = attention_gate(x, skip, filters // 4)
-        x = layers.Concatenate()([x, skip])
-        x = layers.Conv2D(filters, (3, 3), activation='relu', padding='same')(x)
-        x = layers.Dropout(0.3)(x)
-        x = layers.Conv2D(filters, (3, 3), activation='relu', padding='same')(x)
-        return x
+    c1 = double_conv_block(inputs, 32)
+    p1 = layers.MaxPooling2D((2, 2))(c1)
 
-    d1 = upsample_block(bridge, s4, 256)
-    d2 = upsample_block(d1, s3, 128)
-    d3 = upsample_block(d2, s2, 64)
-    d4 = upsample_block(d3, s1, 32)
-    x = layers.Conv2DTranspose(16, (2, 2), strides=(2, 2), padding='same')(d4)
-    outputs = layers.Conv2D(1, (1, 1), activation='sigmoid', padding='same')(x)
-    name = "MobileNetV3_AttUNET" if use_attention else "MobileNetV3_UNET"
-    model = models.Model(inputs, outputs, name=name)
-    model.compile(optimizer=Adam(learning_rate=1e-4),
+    c2 = double_conv_block(p1, 64)
+    p2 = layers.MaxPooling2D((2, 2))(c2)
+
+    c3 = double_conv_block(p2, 128)
+    p3 = layers.MaxPooling2D((2, 2))(c3)
+
+    c4 = double_conv_block(p3, 256)
+    c4 = layers.SpatialDropout2D(0.3)(c4)
+    p4 = layers.MaxPooling2D((2, 2))(c4)
+
+    b5 = double_conv_block(p4, 512)
+    b5 = layers.SpatialDropout2D(0.3)(b5)
+
+    u6 = layers.Conv2DTranspose(256, (2, 2), strides=(2, 2), padding="same")(b5)
+    a6 = attention_gate(u6, c4, inter_filters=64)
+    u6 = layers.Concatenate()([u6, a6])
+    c6 = double_conv_block(u6, 256)
+
+    u7 = layers.Conv2DTranspose(128, (2, 2), strides=(2, 2), padding="same")(c6)
+    a7 = attention_gate(u7, c3, inter_filters=32)
+    u7 = layers.Concatenate()([u7, a7])
+    c7 = double_conv_block(u7, 128)
+
+    u8 = layers.Conv2DTranspose(64, (2, 2), strides=(2, 2), padding="same")(c7)
+    a8 = attention_gate(u8, c2, inter_filters=16)
+    u8 = layers.Concatenate()([u8, a8])
+    c8 = double_conv_block(u8, 64)
+
+    u9 = layers.Conv2DTranspose(32, (2, 2), strides=(2, 2), padding="same")(c8)
+    a9 = attention_gate(u9, c1, inter_filters=8)
+    u9 = layers.Concatenate()([u9, a9])
+    c9 = double_conv_block(u9, 32)
+
+    outputs = layers.Conv2D(1, (1, 1), activation="sigmoid")(c9)
+
+    model = models.Model(inputs, outputs, name="Att_Pure_UNET")
+    model.compile(optimizer=Adam(learning_rate=5e-4),
                   loss=combined_loss,
                   metrics=['accuracy', dice_coef, iou_coef])
     return model
 
 
 def load_test_data(test_dir, target_size=(224, 224)):
-    img_dir = os.path.join(test_dir, "test_images")
+    img_dir  = os.path.join(test_dir, "test_images")
     mask_dir = os.path.join(test_dir, "test_masks")
     if not os.path.exists(img_dir) or not os.path.exists(mask_dir):
         raise FileNotFoundError("cannot find test_data/test_images or test_data/test_masks")
@@ -80,7 +101,7 @@ def load_test_data(test_dir, target_size=(224, 224)):
     for filename in sorted(os.listdir(img_dir)):
         if not filename.lower().endswith(('.png', '.jpg', '.jpeg')):
             continue
-        img_path = os.path.join(img_dir, filename)
+        img_path  = os.path.join(img_dir, filename)
         base_name = filename.rsplit('.', 1)[0]
         mask_path = os.path.join(mask_dir, f"{base_name}_label.png")
 
@@ -115,9 +136,9 @@ if __name__ == "__main__":
 
     BASE_DIR   = "/mnt/c/Users/chloe/OneDrive/桌面/auto_angle"
     SEED       = 123
-    MODEL_PATH = os.path.join(BASE_DIR, f"vessel_lumen_mobilenet_large_unet_aug5.h5")
+    MODEL_PATH = os.path.join(BASE_DIR, f"vessel_lumen_pure_unet_aug5a3g4i_seed{SEED}.h5")
     TEST_DIR   = os.path.join(BASE_DIR, "test_data")
-    PRED_DIR   = os.path.join(BASE_DIR, f"predictions_output_large_aug5")
+    PRED_DIR   = os.path.join(BASE_DIR, f"predictions_output_pure_unet_seed{SEED}")
 
     print("reading testing data...")
     raw_imgs, raw_masks, filenames = load_test_data(TEST_DIR)
@@ -126,14 +147,14 @@ if __name__ == "__main__":
     X_test, Y_test = preprocess_for_inference(raw_imgs, raw_masks)
 
     print(f"loading model {MODEL_PATH} ...")
-    model = build_mobilenetv3_unet(input_shape=(224, 224, 1), use_attention=False)
+    model = build_pure_unet(input_shape=(224, 224, 1))
     model.load_weights(MODEL_PATH)
 
     print("\ngenerating predicted mask...")
     predictions = model.predict(X_test, verbose=0)
 
     os.makedirs(PRED_DIR, exist_ok=True)
-    result_path = os.path.join(BASE_DIR, f"test_mobilenet_large_aug7x7_seed{SEED}_results.txt")
+    result_path = os.path.join(BASE_DIR, f"test_pure_unet_seed{SEED}_results.txt")
     dice_scores = []
 
     with open(result_path, "w", encoding="utf-8") as f:

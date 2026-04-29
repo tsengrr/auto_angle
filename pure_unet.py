@@ -4,10 +4,10 @@ import numpy as np
 import matplotlib.pyplot as plt
 import tensorflow as tf
 from tensorflow.keras import layers, models, backend as K
-from tensorflow.keras.applications import MobileNetV3Large
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping, ReduceLROnPlateau
 import random
+
 SEED = 123
 random.seed(SEED); np.random.seed(SEED); tf.random.set_seed(SEED)
 
@@ -19,42 +19,82 @@ def dice_coef(y_true, y_pred, smooth=1e-6):
     intersection = K.sum(y_true_f * y_pred_f)
     return (2. * intersection + smooth) / (K.sum(y_true_f) + K.sum(y_pred_f) + smooth)
 
-
 def dice_loss(y_true, y_pred):
     return 1 - dice_coef(y_true, y_pred)
 
 def combined_loss(y_true, y_pred):
     return 0.5 * tf.keras.losses.binary_crossentropy(y_true, y_pred) + 0.5 * dice_loss(y_true, y_pred)
 
+
 # --- 模型 ---
-def build_mobilenetv3_unet(input_shape=(224, 224, 1)):
+def double_conv_block(x, filters):
+    x = layers.Conv2D(filters, (3, 3), padding="same", kernel_initializer="he_normal")(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Activation("relu")(x)
+    x = layers.Conv2D(filters, (3, 3), padding="same", kernel_initializer="he_normal")(x)
+    x = layers.BatchNormalization()(x)
+    x = layers.Activation("relu")(x)
+    return x
+
+def attention_gate(g, s, inter_filters):
+    """
+    Attention Gate：讓 decoder 決定 skip connection 哪些區域值得關注
+    g = decoder upsampled 特徵（gating signal）
+    s = encoder skip connection 特徵
+    inter_filters = 中間層 channel 數（通常是 skip channel 的 1/4）
+    """
+    Wg = layers.Conv2D(inter_filters, (1, 1), padding='same')(g)
+    Ws = layers.Conv2D(inter_filters, (1, 1), padding='same')(s)
+    attn = layers.Activation('relu')(layers.Add()([Wg, Ws]))
+    attn = layers.Conv2D(1, (1, 1), padding='same', activation='sigmoid')(attn)
+    return layers.Multiply()([s, attn])
+
+def build_pure_unet(input_shape=(224, 224, 1)):
     inputs = layers.Input(shape=input_shape)
-    x3 = layers.Concatenate()([inputs, inputs, inputs])
-    encoder = MobileNetV3Large(input_tensor=x3, include_top=False, weights='imagenet',include_preprocessing=False)
 
-    s1 = encoder.get_layer('re_lu').output                # 112x112
-    s2 = encoder.get_layer('expanded_conv_2_add').output  # 56x56
-    s3 = encoder.get_layer('expanded_conv_5_add').output  # 28x28
-    s4 = encoder.get_layer('expanded_conv_11_add').output # 14x14
-    bridge = encoder.output                               # 7x7
+    # Encoder
+    c1 = double_conv_block(inputs, 32)
+    p1 = layers.MaxPooling2D((2, 2))(c1)
 
-    def upsample_block(x, skip, filters):
-        x = layers.Conv2DTranspose(filters, (2, 2), strides=(2, 2), padding='same')(x)
-        x = layers.Concatenate()([x, skip])
-        x = layers.Conv2D(filters, (3, 3), activation='relu', padding='same')(x)
-        x = layers.Dropout(0.3)(x)
-        x = layers.Conv2D(filters, (3, 3), activation='relu', padding='same')(x)
-        return x
+    c2 = double_conv_block(p1, 64)
+    p2 = layers.MaxPooling2D((2, 2))(c2)
 
-    d1 = upsample_block(bridge, s4, 256)
-    d2 = upsample_block(d1, s3, 128)
-    d3 = upsample_block(d2, s2, 64)
-    d4 = upsample_block(d3, s1, 32)
-    x = layers.Conv2DTranspose(16, (2, 2), strides=(2, 2), padding='same')(d4)
-    outputs = layers.Conv2D(1, (1, 1), activation='sigmoid', padding='same')(x)
+    c3 = double_conv_block(p2, 128)
+    p3 = layers.MaxPooling2D((2, 2))(c3)
 
-    model = models.Model(inputs, outputs, name="MobileNetV3_UNET")
-    model.compile(optimizer=Adam(learning_rate=1e-4),
+    c4 = double_conv_block(p3, 256)
+    c4 = layers.SpatialDropout2D(0.3)(c4)
+    p4 = layers.MaxPooling2D((2, 2))(c4)
+
+    # Bridge
+    b5 = double_conv_block(p4, 512)
+    b5 = layers.SpatialDropout2D(0.3)(b5)
+
+    # Decoder + Attention Gates
+    u6 = layers.Conv2DTranspose(256, (2, 2), strides=(2, 2), padding="same")(b5)
+    a6 = attention_gate(u6, c4, inter_filters=64)
+    u6 = layers.Concatenate()([u6, a6])
+    c6 = double_conv_block(u6, 256)
+
+    u7 = layers.Conv2DTranspose(128, (2, 2), strides=(2, 2), padding="same")(c6)
+    a7 = attention_gate(u7, c3, inter_filters=32)
+    u7 = layers.Concatenate()([u7, a7])
+    c7 = double_conv_block(u7, 128)
+
+    u8 = layers.Conv2DTranspose(64, (2, 2), strides=(2, 2), padding="same")(c7)
+    a8 = attention_gate(u8, c2, inter_filters=16)
+    u8 = layers.Concatenate()([u8, a8])
+    c8 = double_conv_block(u8, 64)
+
+    u9 = layers.Conv2DTranspose(32, (2, 2), strides=(2, 2), padding="same")(c8)
+    a9 = attention_gate(u9, c1, inter_filters=8)
+    u9 = layers.Concatenate()([u9, a9])
+    c9 = double_conv_block(u9, 32)
+
+    outputs = layers.Conv2D(1, (1, 1), activation="sigmoid")(c9)
+
+    model = models.Model(inputs, outputs, name="Att_Pure_UNET")
+    model.compile(optimizer=Adam(learning_rate=5e-4),
                   loss=combined_loss,
                   metrics=[dice_coef])
     return model
@@ -88,20 +128,14 @@ def load_and_match_data(path):
 
 
 def clip_level_split(imgs, masks, filenames, val_clips=('data1',)):
-    """固定 val = data1，其餘全部丟 train"""
     clip_ids = [fname.split('_', 1)[0] for fname in filenames]
     unique_clips = sorted(set(clip_ids))
-    print(f"[DEBUG] unique_clips = {unique_clips}")
-
     val_set = set(val_clips)
     train_clips = [c for c in unique_clips if c not in val_set]
-
     train_idx = [i for i, cid in enumerate(clip_ids) if cid not in val_set]
     val_idx   = [i for i, cid in enumerate(clip_ids) if cid in val_set]
-
     print(f"clips: {len(unique_clips)} total → {len(train_clips)} train / {len(val_set)} val ({sorted(val_set)})")
     print(f"frames: {len(train_idx)} train / {len(val_idx)} val")
-
     return imgs[train_idx], masks[train_idx], imgs[val_idx], masks[val_idx]
 
 
@@ -120,12 +154,10 @@ def system_augmentation(imgs, masks):
         h, w = img.shape[:2]
 
         for angle in _AUG_ANGLES:
-            # --- 旋轉 ---
             M = cv2.getRotationMatrix2D((w / 2, h / 2), angle, 1)
             r_img  = cv2.warpAffine(img,  M, (w, h))
             r_mask = cv2.warpAffine(mask, M, (w, h), flags=cv2.INTER_NEAREST)
 
-            # --- 3 種幾何變體 ---
             # 幾何 A：原旋轉
             geo_a_img,  geo_a_mask  = r_img, r_mask
 
@@ -133,7 +165,7 @@ def system_augmentation(imgs, masks):
             geo_b_img  = cv2.flip(r_img, 1)
             geo_b_mask = cv2.flip(r_mask, 1)
 
-            # 幾何 C：非等比例拉伸 → center crop 回原尺寸（只放大不縮小，避免尺寸不足）
+            # 幾何 C：非等比例拉伸 → center crop（只放大不縮小）
             sy = random.uniform(1.0, 1.3)
             sx = random.uniform(1.0, 1.15)
             nh, nw = max(int(h * sy), h), max(int(w * sx), w)
@@ -169,12 +201,10 @@ def system_augmentation(imgs, masks):
                 drop_mask = np.ones((h, w), dtype=np.float32)
                 drop_mask[:, dx:dx + dw] = di
                 drop_mask = cv2.GaussianBlur(drop_mask, (15, 1), 0)
-                dropout_img = np.clip(g_img.astype(np.float32) * drop_mask, 0, 255).astype(np.uint8)
-                aug_imgs.append(dropout_img)
+                aug_imgs.append(np.clip(g_img.astype(np.float32) * drop_mask, 0, 255).astype(np.uint8))
                 aug_masks.append(g_mask)
 
     return np.array(aug_imgs), np.array(aug_masks)
-
 
 
 def preprocess_for_model(imgs, masks):
@@ -186,7 +216,7 @@ def preprocess_for_model(imgs, masks):
 if __name__ == "__main__":
 
     DATA_PATH  = "/mnt/c/Users/chloe/OneDrive/桌面/auto_angle"
-    MODEL_PATH = f"/mnt/c/Users/chloe/OneDrive/桌面/auto_angle/vessel_lumen_mobilenet_large_unet_aug5a3g4i_seed{SEED}.h5"
+    MODEL_PATH = f"/mnt/c/Users/chloe/OneDrive/桌面/auto_angle/vessel_lumen_pure_unet_aug5a3g4i_seed{SEED}.h5"
 
     print("load data...")
     raw_imgs, raw_masks, filenames = load_and_match_data(DATA_PATH)
@@ -195,7 +225,6 @@ if __name__ == "__main__":
         raw_imgs, raw_masks, filenames
     )
 
-
     print(f"train frames: {len(train_imgs)}")
     X_aug, Y_aug = system_augmentation(train_imgs, train_masks)
     X_train, Y_train = preprocess_for_model(X_aug, Y_aug)
@@ -203,8 +232,9 @@ if __name__ == "__main__":
     X_val, Y_val = preprocess_for_model(val_imgs, val_masks)
     print(f"augmented train size: {len(X_train)}")
 
-    print("MobileNetV3 + U-Net...")
-    model = build_mobilenetv3_unet(input_shape=(224, 224, 1))
+    print("Pure U-Net...")
+    model = build_pure_unet(input_shape=(224, 224, 1))
+    model.summary()
 
     checkpoint = ModelCheckpoint(
         MODEL_PATH,
@@ -241,7 +271,6 @@ if __name__ == "__main__":
         callbacks=[checkpoint, early_stop, reduce_lr]
     )
 
-    # 訓練歷程視覺化
     plt.figure(figsize=(12, 4))
     plt.subplot(1, 2, 1)
     plt.plot(history.history['dice_coef'], label='Train Dice')
@@ -254,5 +283,6 @@ if __name__ == "__main__":
     plt.plot(history.history['val_loss'], label='Val Loss')
     plt.title('Loss')
     plt.legend()
-    plt.savefig(f"/mnt/c/Users/chloe/OneDrive/桌面/auto_angle/training_history_large_aug5a3g4i_seed{SEED}.png", bbox_inches='tight')
+    plt.savefig(f"/mnt/c/Users/chloe/OneDrive/桌面/auto_angle/training_history_pure_unet_aug5a3g4i_seed{SEED}.png",
+                bbox_inches='tight')
     plt.show()
