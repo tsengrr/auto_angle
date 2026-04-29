@@ -36,13 +36,6 @@ def double_conv_block(x, filters):
     x = layers.Activation("relu")(x)
     return x
 
-def attention_gate(g, s, inter_filters):
-    Wg = layers.Conv2D(inter_filters, (1, 1), padding='same')(g)
-    Ws = layers.Conv2D(inter_filters, (1, 1), padding='same')(s)
-    attn = layers.Activation('relu')(layers.Add()([Wg, Ws]))
-    attn = layers.Conv2D(1, (1, 1), padding='same', activation='sigmoid')(attn)
-    return layers.Multiply()([s, attn])
-
 def build_pure_unet(input_shape=(224, 224, 1)):
     inputs = layers.Input(shape=input_shape)
 
@@ -63,28 +56,24 @@ def build_pure_unet(input_shape=(224, 224, 1)):
     b5 = layers.SpatialDropout2D(0.3)(b5)
 
     u6 = layers.Conv2DTranspose(256, (2, 2), strides=(2, 2), padding="same")(b5)
-    a6 = attention_gate(u6, c4, inter_filters=64)
-    u6 = layers.Concatenate()([u6, a6])
+    u6 = layers.Concatenate()([u6, c4])
     c6 = double_conv_block(u6, 256)
 
     u7 = layers.Conv2DTranspose(128, (2, 2), strides=(2, 2), padding="same")(c6)
-    a7 = attention_gate(u7, c3, inter_filters=32)
-    u7 = layers.Concatenate()([u7, a7])
+    u7 = layers.Concatenate()([u7, c3])
     c7 = double_conv_block(u7, 128)
 
     u8 = layers.Conv2DTranspose(64, (2, 2), strides=(2, 2), padding="same")(c7)
-    a8 = attention_gate(u8, c2, inter_filters=16)
-    u8 = layers.Concatenate()([u8, a8])
+    u8 = layers.Concatenate()([u8, c2])
     c8 = double_conv_block(u8, 64)
 
     u9 = layers.Conv2DTranspose(32, (2, 2), strides=(2, 2), padding="same")(c8)
-    a9 = attention_gate(u9, c1, inter_filters=8)
-    u9 = layers.Concatenate()([u9, a9])
+    u9 = layers.Concatenate()([u9, c1])
     c9 = double_conv_block(u9, 32)
 
     outputs = layers.Conv2D(1, (1, 1), activation="sigmoid")(c9)
 
-    model = models.Model(inputs, outputs, name="Att_Pure_UNET")
+    model = models.Model(inputs, outputs, name="Pure_UNET")
     model.compile(optimizer=Adam(learning_rate=5e-4),
                   loss=combined_loss,
                   metrics=['accuracy', dice_coef, iou_coef])
